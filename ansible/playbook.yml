@@ -1,0 +1,277 @@
+---
+# =================================================================
+# Play 1: Configure All Nodes (Master and Workers)
+# =================================================================
+- name: Configure All Nodes
+  hosts: all
+  become: yes
+
+  # --- Define variables for the entire playbook ---
+  vars:
+    kubernetes_version: "1.34"
+    calico_version: "3.30.0"
+
+  tasks:
+    # --- Task 1.1: Overwrite cloud-init default for /etc/hosts used for jammy64 ---
+    - name: Remove incorrect cloud-init default entry from /etc/hosts
+      lineinfile:
+        path: /etc/hosts
+        regexp: '^127\.0\.2\.1.*'
+        state: absent
+
+    # --- Task 1.2: Hostname Resolution ---
+    - name: Ensure all cluster nodes are in /etc/hosts
+      blockinfile:
+        path: /etc/hosts
+        block: |
+          # --- Kubernetes Cluster Nodes ---
+          192.168.56.10   control-plane
+          192.168.56.11   worker-1
+          192.168.56.12   worker-2
+        marker: "# ANSIBLE MANAGED K8S HOSTS"
+
+    # --- Task 1.3: Disable swap ---
+    - name: Disable swap immediately
+      command: swapoff -a
+    - name: Disable swap permanently in /etc/fstab
+      replace:
+        path: /etc/fstab
+        regexp: '^(\/swap.img.*)$'
+        replace: '# \1'
+
+    # --- Prepare Kernel for Kubernetes ---
+    - name: Load required kernel modules
+      modprobe:
+        name: "{{ item }}"
+        state: present
+      loop:
+        - overlay
+        - br_netfilter
+    - name: Ensure required sysctl parameters are set for Kubernetes networking
+      sysctl:
+        name: "{{ item.key }}"
+        value: "{{ item.value }}"
+        sysctl_set: yes
+        state: present
+        reload: yes
+      loop:
+        - { key: 'net.bridge.bridge-nf-call-iptables', value: '1' }
+        - { key: 'net.ipv4.ip_forward', value: '1' }
+        - { key: 'net.bridge.bridge-nf-call-ip6tables', value: '1' }
+
+    # --- Task 1.4: Install containerd and prerequisites ---
+    - name: Install packages that allow apt to be used over HTTPS
+      apt:
+        name: "{{ packages }}"
+        state: present
+        update_cache: yes
+      vars:
+        packages:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+    - name: Install containerd
+      apt:
+        name: containerd
+        state: present
+
+    # --- Task 1.5: Configure containerd ---
+    - name: Create containerd configuration directory
+      file:
+        path: /etc/containerd
+        state: directory
+    - name: Get default containerd configuration
+      command: containerd config default
+      register: containerd_config_default
+    - name: Save default containerd configuration to file
+      copy:
+        content: "{{ containerd_config_default.stdout }}"
+        dest: /etc/containerd/config.toml
+    - name: Enable SystemdCgroup in containerd config
+      lineinfile:
+        path: /etc/containerd/config.toml
+        regexp: 'SystemdCgroup = false'
+        line: '            SystemdCgroup = true'
+    - name: Restart and enable containerd service
+      systemd:
+        name: containerd
+        state: restarted
+        enabled: yes
+
+    # --- Task 1.6: Install Kubernetes packages ---
+    - name: Ensure /etc/apt/keyrings directory exists
+      file:
+        path: /etc/apt/keyrings
+        state: directory
+        mode: '0755'
+    - name: Download and dearmor Kubernetes GPG key
+      shell: >
+        curl -fsSL https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/Release.key |
+        gpg --dearmor -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+      args:
+        creates: /etc/apt/keyrings/kubernetes-apt-keyring.gpg
+    - name: Add Kubernetes APT repository
+      apt_repository:
+        repo: "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/v{{ kubernetes_version }}/deb/ /"
+        state: present
+        filename: kubernetes
+    - name: Install kubelet, kubeadm, and kubectl
+      apt:
+        name: "{{ item }}"
+        state: present
+        update_cache: yes
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+    - name: Hold Kubernetes package versions
+      command: apt-mark hold {{ item }}
+      loop:
+        - kubelet
+        - kubeadm
+        - kubectl
+
+# =================================================================
+# Play 2: Configure the Master Node
+# =================================================================
+- name: Configure Master Node
+  hosts: control_plane
+  become: yes
+  vars:
+    # Make variables available to this play as well
+    kubernetes_version: "1.34"
+    calico_version: "3.30.0"
+  tasks:
+    - name: Initialize the cluster using kubeadm
+      command: >
+        kubeadm init
+        --apiserver-advertise-address="192.168.56.10"
+        --pod-network-cidr="192.168.0.0/16"
+      args:
+        creates: /etc/kubernetes/admin.conf
+
+    - name: Create .kube directory for the vagrant user
+      file:
+        path: /home/vagrant/.kube
+        state: directory
+        owner: vagrant
+        group: vagrant
+    - name: Copy admin.conf to vagrant user's .kube directory
+      copy:
+        src: /etc/kubernetes/admin.conf
+        dest: /home/vagrant/.kube/config
+        remote_src: yes
+        owner: vagrant
+        group: vagrant
+
+    - name: Install Calico pod network
+      command: "kubectl apply -f https://raw.githubusercontent.com/projectcalico/calico/v{{ calico_version }}/manifests/calico.yaml"
+      become_user: vagrant
+      args:
+        creates: /etc/cni/net.d/10-calico.conflist
+
+    - name: Generate and save the join command
+      command: kubeadm token create --print-join-command
+      register: join_command_raw
+    - name: Copy join command to a local file
+      local_action:
+        module: copy
+        content: "{{ join_command_raw.stdout }}"
+        dest: "./join-command"
+      become: no
+
+# =================================================================
+# Play 3: Configure the Worker Nodes
+# =================================================================
+- name: Configure Worker Nodes
+  hosts: workers
+  become: yes
+  tasks:
+    - name: Copy the join command from local file to the servers
+      copy:
+        src: ./join-command
+        dest: /tmp/join-command.sh
+        mode: '0777'
+
+    - name: Join the nodes to the cluster
+      command: sh /tmp/join-command.sh
+      args:
+        creates: /etc/kubernetes/kubelet.conf
+
+# =================================================================
+# Play 4: Deploy Monitoring Stack
+# =================================================================
+- name: Deploy Monitoring and Observability Stack
+  hosts: control_plane
+  become: yes
+  tasks:
+    # --- These tasks run as root to install dependencies ---
+    - name: Install pip for Python
+      apt:
+        name: python3-pip
+        state: present
+        update_cache: yes
+
+    - name: Install Kubernetes Python library for Ansible modules
+      pip:
+        name: kubernetes
+        state: present
+
+    - name: Download and install Helm
+      shell: "curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash"
+      args:
+        creates: /usr/local/bin/helm
+
+    # --- This block runs all Kubernetes tasks as the 'vagrant' user ---
+    - name: Run Kubernetes tasks as the vagrant user
+      become: no
+      block:
+        # --- Task 4.1: Install cert-manager ---
+        - name: Add Jetstack (cert-manager) Helm repository
+          kubernetes.core.helm_repository:
+            name: jetstack
+            repo_url: https://charts.jetstack.io
+
+        - name: Install cert-manager to handle cluster certificates
+          kubernetes.core.helm:
+            name: cert-manager
+            chart_ref: jetstack/cert-manager
+            release_namespace: cert-manager
+            create_namespace: yes
+            wait: yes
+            values:
+              installCRDs: true
+
+        # --- Task 4.2: Install Metrics Server ---
+        - name: Apply Metrics Server manifest
+          kubernetes.core.k8s:
+            state: present
+            src: https://github.com/kubernetes-sigs/metrics-server/releases/latest/download/components.yaml
+
+        - name: Patch Metrics Server to work with kubeadm
+          command: "kubectl patch deployment metrics-server -n kube-system --type='json' -p='[{\"op\": \"add\", \"path\": \"/spec/template/spec/containers/0/args/-\", \"value\": \"--kubelet-insecure-tls\"}]'"
+          vars:
+            ansible_command_delay: 10 # Give deployment a moment to be created
+
+        # --- Task 4.3: Install Prometheus/Grafana ---
+        - name: Add Prometheus Helm repository
+          kubernetes.core.helm_repository:
+            name: prometheus-community
+            repo_url: https://prometheus-community.github.io/helm-charts
+
+        - name: Deploy kube-prometheus-stack with webhooks enabled
+          kubernetes.core.helm:
+            name: prometheus
+            chart_ref: prometheus-community/kube-prometheus-stack
+            release_namespace: monitoring
+            create_namespace: yes
+            wait: yes
+            timeout: 15m # Give this large chart plenty of time to install
+            values:
+              grafana:
+                enabled: true
+              alertmanager:
+                enabled: false
+              prometheusOperator:
+                admissionWebhooks:
+                  enabled: true 

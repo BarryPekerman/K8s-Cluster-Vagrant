@@ -1,0 +1,9 @@
+#Whitelist
+*
+
+!.gitignore
+!Vagrantfile
+!ansible.cfg
+!ansible/
+!ansible/inventory
+!ansible/playbook.yml

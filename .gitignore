@@ -1,9 +1,28 @@
-#Whitelist
+# Whitelist
 *
 
+# Core files
 !.gitignore
+!README.md
 !Vagrantfile
+!vagrant-vars.rb
 !ansible.cfg
+
+# Ansible configuration
 !ansible/
 !ansible/inventory
 !ansible/playbook.yml
+
+# Scripts
+!scripts/
+!scripts/setup.sh
+!scripts/teardown.sh
+!scripts/provision.sh
+
+# Temporary files (created by scripts)
+ansible/join-command
+ssh-config
+setup.log
+teardown.log
+*.log
+
